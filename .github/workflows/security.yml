@@ -1,0 +1,220 @@
+name: Security
+
+# Static analysis, dependency review and secret scanning. Split from `ci.yml`
+# so the fast build gate stays fast: a leaked credential or a new critical
+# advisory fails its own job, and the workflow run makes it obvious which one.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, because a dependency is disclosed after it was merged. A green
+    # build from last month says nothing about today's advisory database.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default; the jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+jobs:
+  # ── SAST: CodeQL ────────────────────────────────────────────────────────────
+  # Data-flow analysis over the whole monorepo. Unlike a linter, it follows a
+  # value from an untrusted source to a dangerous sink, which is the class of
+  # bug a hand-written review of a diff reliably misses.
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # `upload:false` below is what makes this work on a private repository.
+    # Publishing a SARIF to code scanning needs GitHub Advanced Security, a paid
+    # feature; without it the upload fails and takes the job with it. The
+    # analysis itself needs nothing, so it runs either way and the report is
+    # attached as a build artifact. Set the `CODE_SCANNING_ENABLED` repository
+    # variable to `true` once GHAS is on and the results will also reach the
+    # Security tab.
+    permissions:
+      contents: read
+      # CodeQL reads the workflow run for its status report; without this the
+      # action fails with "Resource not accessible by integration".
+      actions: read
+      packages: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `security-and-quality` adds maintainability queries on top of the
+          # default security suite. `security-extended` trades noise for
+          # recall; the default set is the one that stays actionable.
+          queries: security-and-quality
+
+      # CodeQL's JS/TS extractor reads the source it is pointed at; it does not
+      # need a compiled artifact, and skipping the build keeps this job to
+      # minutes rather than the full workspace build.
+      - name: Perform analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+          output: sarif-results
+          upload: ${{ vars.CODE_SCANNING_ENABLED == 'true' }}
+
+      # The gate, independent of whether the upload happened. Without it an
+      # unuploaded report is a report nobody reads, and the job would pass by
+      # doing nothing.
+      - name: Fail on high or critical findings
+        run: node scripts/check-sarif.mjs sarif-results
+
+      - name: Attach the SARIF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif
+          path: sarif-results
+          retention-days: 14
+
+  # ── Dependencies: known advisories and licence/version drift in a PR ────────
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Blocking: these are the packages that end up inside the images, so an
+      # advisory here is reachable by an attacker.
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level=high
+
+      # Informational: dev-only tooling. It is not shipped, and advisories with
+      # no patched release would otherwise pin this gate red forever. Surfaced
+      # in the log so it stays visible instead of silently ignored.
+      - name: Report dev dependency advisories
+        continue-on-error: true
+        run: pnpm audit --audit-level=high
+
+      # Blocks a PR that introduces a vulnerable or licence-incompatible
+      # dependency, before the lockfile change is merged.
+      #
+      # Gated on Advanced Security for the same reason the CodeQL upload is: the
+      # action fails outright with "Dependency review is not supported on this
+      # repository" without it. The advisory half of what it does is already
+      # covered by `pnpm audit --prod` above, which runs everywhere and fails on
+      # a high or critical advisory in a package that ships; what is lost on a
+      # repository without Advanced Security is the licence check and the
+      # in-PR summary.
+      - name: Dependency review
+        if: github.event_name == 'pull_request' && vars.CODE_SCANNING_ENABLED == 'true'
+        uses: actions/dependency-review-action@v4.9.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  # ── Secrets: a credential in git history outlives the commit that removed it ─
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret is usually introduced long before it is
+          # noticed, and a shallow clone would report a clean tree.
+          fetch-depth: 0
+
+      - name: Scan the tree and history with gitleaks
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            detect --source=/repo --redact --verbose --exit-code=1
+
+  # ── Infrastructure as code ──────────────────────────────────────────────────
+  iac:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `--failure-threshold=warning` catches the whole class of "runs as root",
+      # "unpinned base image" and "apt without --no-install-recommends" issues
+      # that a reviewer skims past.
+      - name: Lint the Dockerfiles
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            hadolint/hadolint:v2.15.1 \
+            hadolint \
+            --failure-threshold=warning \
+            docker/api.Dockerfile docker/web.Dockerfile
+
+      - name: Lint the workflows
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            rhysd/actionlint:1.7.12 \
+            -color
+
+  # ── The published images, scanned as a user would pull them ─────────────────
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the images
+        run: |
+          docker build -f docker/api.Dockerfile -t app-api:ci .
+          docker build -f docker/web.Dockerfile -t app-web:ci .
+
+      # Scans the OS packages and language dependencies inside the image, which
+      # is the only inventory that reflects what actually ships.
+      - name: Scan the API image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: app-api:ci
+          format: table
+          severity: CRITICAL,HIGH
+          # An advisory with no released fix is not something this build can
+          # resolve; report it and keep the gate on what is actionable.
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan the web image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: app-web:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan the repository configuration
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '1'

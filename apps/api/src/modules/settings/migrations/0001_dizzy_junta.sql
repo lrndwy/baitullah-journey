@@ -1,0 +1,1 @@
+ALTER TABLE "settings"."app_settings" ALTER COLUMN "site_name" SET DEFAULT 'Baitullah Journey';

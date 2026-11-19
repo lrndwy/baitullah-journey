@@ -1,0 +1,15 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Native modules whose install scripts are explicitly allowed to run.
+#
+# pnpm 11+ replaced `onlyBuiltDependencies` with `allowBuilds`, and
+# `strictDepBuilds` now defaults to true — an unreviewed build script fails the
+# install outright. Listing them here means a fresh `pnpm install` (and CI) needs
+# no interactive `pnpm approve-builds`.
+allowBuilds:
+  esbuild: true
+  '@tailwindcss/oxide': true
+  sharp: true
+  unrs-resolver: true

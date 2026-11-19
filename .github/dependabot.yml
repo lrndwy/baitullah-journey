@@ -1,0 +1,55 @@
+version: 2
+updates:
+  # Grouped, because a monorepo with one PR per dependency is a queue nobody
+  # reads — and an unread queue is how a critical patch sits unmerged for weeks.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    groups:
+      # Security patches ship as their own PR, so they can be merged and
+      # deployed without waiting for a version bump to be reviewed.
+      security:
+        applies-to: security-updates
+        patterns: ['*']
+      production:
+        dependency-type: production
+        update-types: ['minor', 'patch']
+      development:
+        dependency-type: development
+        update-types: ['minor', 'patch']
+    ignore:
+      # Majors are a migration, not a chore: they get scheduled deliberately
+      # rather than dropped into the review queue by a bot.
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
+
+  # Base images and the actions themselves are dependencies too, and a stale
+  # `node:22-alpine` is a CVE with a friendly name.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    ignore:
+      # Same reasoning as npm majors, and demonstrated: Dependabot proposed
+      # node:22-alpine -> node:25-alpine, and Node 25 no longer ships corepack,
+      # so `RUN corepack enable` fails the build. A base-image major is a
+      # migration — here, replacing corepack with a direct pnpm install — and
+      # belongs in a deliberate change, not a bot PR that stays red.
+      - dependency-name: 'node'
+        update-types: ['version-update:semver-major']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ['*']

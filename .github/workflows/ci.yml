@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Called by the release workflow so images are only published on a green build.
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/app
+  REDIS_URL: redis://localhost:6379
+  JWT_ACCESS_SECRET: ci-access-secret-not-for-production
+  JWT_REFRESH_SECRET: ci-refresh-secret-not-for-production
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The architectural rules are a build gate, not a code review habit.
+      - name: Module boundaries
+        run: pnpm boundaries
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      # Proves core and module migrations apply cleanly against an empty
+      # database, which is the first thing that breaks on a real deploy.
+      - name: Apply migrations
+        run: pnpm db:migrate
+
+      - name: Migrations are idempotent
+        run: pnpm db:migrate
+
+  # The unit tests cover the guards in isolation; this covers the image, which
+  # is what actually ships. It is the job that catches "the guard is a provider
+  # but was never registered as APP_GUARD", and a dev sign-in that survives into
+  # a production configuration.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the images
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/api.Dockerfile
+          tags: app-api:ci
+          load: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build the web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/web.Dockerfile
+          tags: app-web:ci
+          load: true
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      # `--network host` so the container reaches the service containers on
+      # localhost, exactly as a compose deployment reaches its dependencies.
+      - name: Run the API image in development mode
+        run: |
+          docker run -d --name api-dev --network host \
+            -e NODE_ENV=development \
+            -e PORT=3000 \
+            -e DATABASE_URL=postgres://postgres:postgres@localhost:5432/app \
+            -e REDIS_URL=redis://localhost:6379 \
+            -e JWT_ACCESS_SECRET=ci-access-secret-not-for-production \
+            -e JWT_REFRESH_SECRET=ci-refresh-secret-not-for-production \
+            -e WEB_ORIGIN=http://localhost:3001 \
+            -e AUTH_DEV_LOGIN=true \
+            -e LOG_LEVEL=warn \
+            app-api:ci
+
+      - name: Wait for readiness
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/ready >/dev/null 2>&1; then
+              echo "API is ready after ${attempt} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API never became ready. Container logs:"
+          docker logs api-dev
+          exit 1
+
+      - name: Security smoke (development)
+        run: node scripts/smoke-security.mjs http://localhost:3000
+
+      # The same image, reconfigured to look like production. This is the
+      # assertion that matters: the local passwordless sign-in must be refused,
+      # because the first account created becomes the administrator.
+      - name: Restart in a production configuration
+        run: |
+          docker rm -f api-dev
+          docker run -d --name api-prod --network host \
+            -e NODE_ENV=production \
+            -e PORT=3000 \
+            -e DATABASE_URL=postgres://postgres:postgres@localhost:5432/app \
+            -e REDIS_URL=redis://localhost:6379 \
+            -e JWT_ACCESS_SECRET=ci-access-secret-not-for-production \
+            -e JWT_REFRESH_SECRET=ci-refresh-secret-not-for-production \
+            -e WEB_ORIGIN=http://localhost:3001 \
+            -e AUTH_DEV_LOGIN=true \
+            -e LOG_LEVEL=warn \
+            app-api:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/ready >/dev/null 2>&1; then exit 0; fi
+            sleep 2
+          done
+          docker logs api-prod
+          exit 1
+
+      - name: Security smoke (production)
+        run: node scripts/smoke-security.mjs http://localhost:3000 --production
+
+      # One image, two configurations: if this fails, the web image still bakes
+      # the API origin in at build time.
+      - name: The web image reads its API origin at start
+        run: |
+          docker run -d --name web-runtime --network host \
+            -e PORT=3001 \
+            -e API_INTERNAL_URL=http://localhost:3000 \
+            -e API_PUBLIC_URL=http://api.example.test:9999 \
+            app-web:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:3001/login >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:3001/login | grep -q 'api.example.test:9999' \
+            || { echo "The injected API origin is missing from the served HTML"; docker logs web-runtime; exit 1; }
+
+      - name: Container logs
+        if: failure()
+        run: |
+          docker logs api-prod ||true
+          docker logs web-runtime ||true

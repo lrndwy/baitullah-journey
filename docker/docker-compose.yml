@@ -1,0 +1,129 @@
+name: baitullah-journey
+
+# Local development stack: everything in containers, one command.
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# The API applies migrations on boot, so no manual migration step is needed.
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: app
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment: *postgres-env
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # S3-compatible object storage. RustFS stands in locally; MinIO, MaxIO or an
+  # external S3 endpoint work identically, because all of them speak the same API.
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - rustfsdata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -s -o /dev/null http://localhost:9000/']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/api.Dockerfile
+    environment:
+      NODE_ENV: development
+      PORT: '3000'
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: dev-only-access-secret-change-me
+      JWT_REFRESH_SECRET: dev-only-refresh-secret-change-me
+      WEB_ORIGIN: http://localhost:3001
+      AUTH_DEV_LOGIN: 'false'
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@baitullahjourney.id}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMeNow1!}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Administrator}
+      LOG_LEVEL: debug
+      # Module switches, e.g. `MODULES_DISABLED=users docker compose up -d api`
+      MODULES_ENABLED: ${MODULES_ENABLED:-}
+      MODULES_DISABLED: ${MODULES_DISABLED:-}
+      S3_ENDPOINT: http://rustfs:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: rustfsadmin
+      S3_SECRET_ACCESS_KEY: rustfsadmin
+      S3_BUCKET: app
+      S3_FORCE_PATH_STYLE: 'true'
+      # Presigned URLs must point at an address the browser can resolve, which
+      # is not the in-cluster service name.
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/web.Dockerfile
+      args:
+        # Fallback only: the browser-facing origin is read from the environment
+        # at container start (`API_PUBLIC_URL`), so changing it needs a restart,
+        # not a rebuild.
+        NEXT_PUBLIC_API_URL: http://localhost:3000
+    environment:
+      NODE_ENV: production
+      PORT: '3001'
+      # Server-side fetches (branding) must reach the API over the compose
+      # network; the browser-facing URL is injected into the page instead.
+      API_INTERNAL_URL: http://api:3000
+      API_PUBLIC_URL: ${API_PUBLIC_URL:-http://localhost:3000}
+    ports:
+      - '3001:3001'
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:
+  redisdata:
+  rustfsdata:
